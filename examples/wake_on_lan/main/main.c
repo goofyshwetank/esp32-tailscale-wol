@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -574,16 +575,42 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void url_decode(char *dst, const char *src) {
+    char a, b;
+    while (*src) {
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit((int)a) && isxdigit((int)b))) {
+            if (a >= 'a') a -= 'a' - 'A';
+            if (a >= 'A') a -= 'A' - 10;
+            else a -= '0';
+            if (b >= 'a') b -= 'a' - 'A';
+            if (b >= 'A') b -= 'A' - 10;
+            else b -= '0';
+            *dst++ = 16 * a + b;
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
 static esp_err_t wake_get_handler(httpd_req_t *req) {
     char query[128];
     char mac_str[32] = "";
+    char decoded_mac[32] = "";
     bool success = false;
     char err_msg[64] = "";
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "mac", mac_str, sizeof(mac_str)) == ESP_OK) {
+            url_decode(decoded_mac, mac_str);
             uint8_t mac[6];
-            if (parse_mac_address(mac_str, mac)) {
+            if (parse_mac_address(decoded_mac, mac)) {
                 esp_err_t err = send_wol_packet(mac);
                 if (err == ESP_OK) {
                     success = true;
@@ -798,7 +825,32 @@ static void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+#if CONFIG_WOL_STATIC_IP_ENABLED
+    esp_netif_dhcpc_stop(sta_netif);
+
+    esp_ip4_addr_t ip, netmask, gw;
+    esp_netif_str_to_ip4(CONFIG_WOL_STATIC_IP, &ip);
+    esp_netif_str_to_ip4(CONFIG_WOL_STATIC_NETMASK, &netmask);
+    esp_netif_str_to_ip4(CONFIG_WOL_STATIC_GATEWAY, &gw);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip = ip;
+    ip_info.netmask = netmask;
+    ip_info.gw = gw;
+    esp_netif_set_ip_info(sta_netif, &ip_info);
+
+    esp_netif_dns_info_t dns_info;
+    esp_netif_str_to_ip4(CONFIG_WOL_STATIC_GATEWAY, &dns_info.ip.u_addr.ip4);
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+
+    ESP_LOGI(TAG, "Static IP configured: %s, GW: %s, Mask: %s",
+             CONFIG_WOL_STATIC_IP, CONFIG_WOL_STATIC_GATEWAY, CONFIG_WOL_STATIC_NETMASK);
+#else
+    (void)sta_netif;
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));

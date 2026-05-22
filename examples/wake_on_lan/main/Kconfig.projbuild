@@ -12,4 +12,30 @@ menu "Wake-on-LAN Configuration"
         help
             Port to listen on for incoming UDP trigger messages.
 
+    config WOL_STATIC_IP_ENABLED
+        bool "Enable Static Local IP"
+        help
+            Enable static local IP address instead of DHCP.
+
+    config WOL_STATIC_IP
+        string "Static Local IP Address"
+        depends on WOL_STATIC_IP_ENABLED
+        default "192.168.1.150"
+        help
+            The static IP address to assign to the ESP32 (e.g. 192.168.1.150).
+
+    config WOL_STATIC_GATEWAY
+        string "Gateway IP Address"
+        depends on WOL_STATIC_IP_ENABLED
+        default "192.168.1.1"
+        help
+            The gateway IP address (usually your router's IP, e.g. 192.168.1.1).
+
+    config WOL_STATIC_NETMASK
+        string "Subnet Netmask"
+        depends on WOL_STATIC_IP_ENABLED
+        default "255.255.255.0"
+        help
+            The netmask for the network subnet (usually 255.255.255.0).
+
 endmenu
