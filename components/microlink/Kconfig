@@ -72,7 +72,7 @@ menu "MicroLink V2 Configuration"
     config ML_H2_BUFFER_SIZE_KB
         int "HTTP/2 receive buffer size (KB)"
         default 512
-        range 64 2048
+        range 16 2048
         help
             Size of the PSRAM-allocated buffer for receiving HTTP/2 frames
             from the Tailscale control plane (MapResponse).
@@ -81,6 +81,7 @@ menu "MicroLink V2 Configuration"
             Each peer is roughly 1-2KB of JSON. After the initial response,
             delta updates (PeersChanged/PeersRemoved) are much smaller.
 
+            - 16:   ~8 peers (ultra low-RAM personal tailnets)
             - 64:   ~30 peers (small tailnets)
             - 512:  ~300 peers (default, most deployments)
             - 1024: ~600 peers (large enterprise tailnets)
@@ -89,7 +90,7 @@ menu "MicroLink V2 Configuration"
     config ML_JSON_BUFFER_SIZE_KB
         int "JSON parse buffer size (KB)"
         default 512
-        range 64 2048
+        range 16 2048
         help
             Size of the PSRAM-allocated buffer for parsing JSON MapResponse
             data. cJSON builds an in-memory DOM tree that uses 2-3x the

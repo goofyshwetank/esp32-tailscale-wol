@@ -1,0 +1,15 @@
+menu "Wake-on-LAN Configuration"
+
+    config WOL_TARGET_MAC
+        string "Default Target MAC Address"
+        default "00:11:22:33:44:55"
+        help
+            The MAC address of the default machine you wish to wake up, in form AA:BB:CC:DD:EE:FF.
+
+    config WOL_UDP_PORT
+        int "UDP Listener Port on Tailscale"
+        default 9000
+        help
+            Port to listen on for incoming UDP trigger messages.
+
+endmenu

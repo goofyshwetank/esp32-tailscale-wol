@@ -651,8 +651,8 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
      * beyond the 65535 default. SETTINGS INITIAL_WINDOW_SIZE only sets per-stream
      * window; the connection-level window starts at 65535 and must be explicitly
      * expanded with WINDOW_UPDATE on stream 0. */
-    uint32_t conn_window_delta = ML_H2_BUFFER_SIZE - 65535;
-    if (conn_window_delta > 0) {
+    if (ML_H2_BUFFER_SIZE > 65535) {
+        uint32_t conn_window_delta = ML_H2_BUFFER_SIZE - 65535;
         int wu_len = ml_h2_build_window_update(h2_init + pos, sizeof(h2_init) - pos,
                                                 0, conn_window_delta);
         if (wu_len > 0) pos += wu_len;
@@ -1412,10 +1412,10 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * (60s) before proceeding, which dominates connection time on cellular. */
     bool got_end_stream = false;
     for (int read_count = 0; read_count < 200; read_count++) {
-        uint8_t *frame_buf = ml_psram_malloc(65536);
+        uint8_t *frame_buf = ml_psram_malloc(32768);
         if (!frame_buf) break;
 
-        int frame_len = noise_recv(ml, noise, frame_buf, 65536);
+        int frame_len = noise_recv(ml, noise, frame_buf, 32768);
         if (frame_len <= 0) {
             free(frame_buf);
             break;
@@ -1999,10 +1999,10 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
 
-    uint8_t *frame_buf = ml_psram_malloc(65536);
+    uint8_t *frame_buf = ml_psram_malloc(32768);
     if (!frame_buf) return 0;
 
-    int frame_len = noise_recv(ml, noise, frame_buf, 65536);
+    int frame_len = noise_recv(ml, noise, frame_buf, 32768);
 
     if (frame_len <= 0) {
         free(frame_buf);
