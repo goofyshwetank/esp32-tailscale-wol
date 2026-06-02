@@ -7,15 +7,19 @@
  * - Exposes GET /api/status for real-time ESP32/VPN statistics
  * - Exposes GET /api/wake?mac=xx:xx:xx:xx:xx:xx to trigger WOL broadcasts
  * - Listens on Tailscale UDP port 9000 to trigger WOL via UDP payload
+ * - Emulates WLED JSON API for HyperHDR compatibility (/json, /json/state, etc.)
+ * - Supports DDP (Distributed Display Protocol) on port 4048 for pixel streaming
  */
 
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <math.h>
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -64,6 +68,13 @@ static httpd_handle_t server = NULL;
 static uint32_t wifi_ip_addr = 0;
 static char wifi_ip_str[16] = "0.0.0.0";
 static char vpn_ip_str[16] = "0.0.0.0";
+
+#if CONFIG_WOL_LED_STRIP_ENABLED
+/* WLED emulation state */
+static bool wled_on = true;
+static uint8_t wled_brightness = 255;
+static char esp_mac_str[13] = "000000000000"; /* hex MAC for WLED info */
+#endif
 
 /* HTML Dashboard content (glassmorphic dark theme) */
 static const char html_page[] = 
@@ -647,6 +658,142 @@ static esp_err_t wake_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+#if CONFIG_WOL_LED_STRIP_ENABLED
+/* ============================================================================
+ * WLED JSON API Handlers — HyperHDR Compatibility
+ * ========================================================================== */
+
+/* Helper: Build WLED state JSON fragment into a buffer */
+static int wled_build_state_json(char *buf, size_t buflen) {
+    return snprintf(buf, buflen,
+        "{\"on\":%s,\"bri\":%d,\"transition\":7,\"ps\":-1,\"pl\":-1,"
+        "\"seg\":[{\"id\":0,\"start\":0,\"stop\":%d,\"len\":%d,"
+        "\"col\":[[255,255,255]],\"fx\":0,\"sx\":128,\"ix\":128,"
+        "\"sel\":true,\"on\":true}]}",
+        wled_on ? "true" : "false",
+        (int)wled_brightness,
+        CONFIG_WOL_LED_STRIP_NUM,
+        CONFIG_WOL_LED_STRIP_NUM);
+}
+
+/* Helper: Build WLED info JSON fragment into a buffer */
+static int wled_build_info_json(char *buf, size_t buflen) {
+    return snprintf(buf, buflen,
+        "{\"ver\":\"0.14.0\",\"vid\":2312080,"
+        "\"leds\":{\"count\":%d,\"fps\":30,\"rgbw\":false,\"wv\":0,\"pwr\":0,\"maxpwr\":850},"
+        "\"name\":\"MicroLink-WLED\",\"udpport\":21324,\"live\":false,"
+        "\"fxcount\":1,\"palcount\":1,"
+        "\"arch\":\"esp32\",\"core\":\"v4.4\","
+        "\"freeheap\":%lu,\"uptime\":%lu,"
+        "\"brand\":\"WLED\",\"product\":\"MicroLink\","
+        "\"mac\":\"%s\",\"ip\":\"%s\"}",
+        CONFIG_WOL_LED_STRIP_NUM,
+        (unsigned long)esp_get_free_heap_size(),
+        (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000),
+        esp_mac_str,
+        wifi_ip_str);
+}
+
+/* GET /json — Full WLED response (state + info + effects + palettes) */
+static esp_err_t wled_json_get_handler(httpd_req_t *req) {
+    char *json_buf = malloc(1024);
+    if (!json_buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char state_buf[384];
+    char info_buf[512];
+    wled_build_state_json(state_buf, sizeof(state_buf));
+    wled_build_info_json(info_buf, sizeof(info_buf));
+
+    int len = snprintf(json_buf, 1024,
+        "{\"state\":%s,\"info\":%s,\"effects\":[\"Solid\"],\"palettes\":[\"Default\"]}",
+        state_buf, info_buf);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_buf, len);
+    free(json_buf);
+    return ESP_OK;
+}
+
+/* GET /json/state */
+static esp_err_t wled_state_get_handler(httpd_req_t *req) {
+    char buf[384];
+    int len = wled_build_state_json(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
+/* POST /json/state — Accept state changes (on/off, brightness) */
+static esp_err_t wled_state_post_handler(httpd_req_t *req) {
+    char body[256];
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    ESP_LOGI(TAG, "WLED state POST: %s", body);
+
+    /* Minimal JSON parsing for "on" and "bri" fields */
+    char *on_ptr = strstr(body, "\"on\"");
+    if (on_ptr) {
+        if (strstr(on_ptr, "true"))  wled_on = true;
+        if (strstr(on_ptr, "false")) wled_on = false;
+    }
+
+    char *bri_ptr = strstr(body, "\"bri\"");
+    if (bri_ptr) {
+        bri_ptr = strchr(bri_ptr, ':');
+        if (bri_ptr) {
+            int bri_val = atoi(bri_ptr + 1);
+            if (bri_val >= 0 && bri_val <= 255) {
+                wled_brightness = (uint8_t)bri_val;
+            }
+        }
+    }
+
+    /* If turned off, clear the strip immediately */
+    if (!wled_on && led_strip_h) {
+        led_strip_clear(led_strip_h);
+        led_strip_refresh(led_strip_h);
+    }
+
+    /* Return updated state */
+    char buf[384];
+    int len = wled_build_state_json(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
+/* GET /json/info */
+static esp_err_t wled_info_get_handler(httpd_req_t *req) {
+    char buf[512];
+    int len = wled_build_info_json(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
+/* GET /json/eff */
+static esp_err_t wled_eff_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "[\"Solid\"]");
+    return ESP_OK;
+}
+
+/* GET /json/pal */
+static esp_err_t wled_pal_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "[\"Default\"]");
+    return ESP_OK;
+}
+#endif /* CONFIG_WOL_LED_STRIP_ENABLED */
+
 /* ============================================================================
  * HTTP Server Setup
  * ========================================================================== */
@@ -656,6 +803,7 @@ static httpd_handle_t start_webserver(void) {
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.max_uri_handlers = 16; /* Extra slots for WLED API endpoints */
 
     httpd_uri_t index_uri = {
         .uri       = "/",
@@ -683,6 +831,24 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &wake_uri);
+
+#if CONFIG_WOL_LED_STRIP_ENABLED
+        /* Register WLED-compatible JSON API endpoints */
+        httpd_uri_t wled_json_uri = { .uri = "/json", .method = HTTP_GET, .handler = wled_json_get_handler };
+        httpd_uri_t wled_state_get_uri = { .uri = "/json/state", .method = HTTP_GET, .handler = wled_state_get_handler };
+        httpd_uri_t wled_state_post_uri = { .uri = "/json/state", .method = HTTP_POST, .handler = wled_state_post_handler };
+        httpd_uri_t wled_info_uri = { .uri = "/json/info", .method = HTTP_GET, .handler = wled_info_get_handler };
+        httpd_uri_t wled_eff_uri = { .uri = "/json/eff", .method = HTTP_GET, .handler = wled_eff_get_handler };
+        httpd_uri_t wled_pal_uri = { .uri = "/json/pal", .method = HTTP_GET, .handler = wled_pal_get_handler };
+
+        httpd_register_uri_handler(server, &wled_json_uri);
+        httpd_register_uri_handler(server, &wled_state_get_uri);
+        httpd_register_uri_handler(server, &wled_state_post_uri);
+        httpd_register_uri_handler(server, &wled_info_uri);
+        httpd_register_uri_handler(server, &wled_eff_uri);
+        httpd_register_uri_handler(server, &wled_pal_uri);
+        ESP_LOGI(TAG, "WLED JSON API endpoints registered");
+#endif
         return server;
     }
 
@@ -848,8 +1014,28 @@ static void led_strip_init(void) {
     led_strip_clear(led_strip_h);
     ESP_LOGI(TAG, "WS2812B LED strip initialized on GPIO %d, %d LEDs", 
              CONFIG_WOL_LED_STRIP_GPIO, CONFIG_WOL_LED_STRIP_NUM);
+
+    /* Read ESP32 MAC address for WLED info response */
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(esp_mac_str, sizeof(esp_mac_str), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "WLED emulation MAC: %s", esp_mac_str);
 }
 
+/* Helper: Apply brightness scaling and write pixel to strip */
+static inline void led_set_pixel_with_brightness(int idx, uint8_t r, uint8_t g, uint8_t b) {
+    if (wled_brightness < 255) {
+        r = (uint8_t)((uint16_t)r * wled_brightness / 255);
+        g = (uint8_t)((uint16_t)g * wled_brightness / 255);
+        b = (uint8_t)((uint16_t)b * wled_brightness / 255);
+    }
+    led_strip_set_pixel(led_strip_h, idx, r, g, b);
+}
+
+/* ============================================================================
+ * UDPRAW Receiver Task (Port 19446) — Legacy HyperHDR support
+ * ========================================================================== */
 static void led_udp_task(void *pvParameters) {
     uint8_t rx_buffer[1500];
     struct sockaddr_in dest_addr;
@@ -896,16 +1082,15 @@ static void led_udp_task(void *pvParameters) {
                 continue;
             }
 
+            if (!wled_on) continue; /* Respect WLED on/off state */
+
             // Parse raw RGB packet
             // Packet should contain 3 bytes (R, G, B) per LED.
             int num_leds_received = len / 3;
             int limit = (num_leds_received < CONFIG_WOL_LED_STRIP_NUM) ? num_leds_received : CONFIG_WOL_LED_STRIP_NUM;
 
             for (int i = 0; i < limit; i++) {
-                uint8_t r = rx_buffer[i * 3];
-                uint8_t g = rx_buffer[i * 3 + 1];
-                uint8_t b = rx_buffer[i * 3 + 2];
-                led_strip_set_pixel(led_strip_h, i, r, g, b);
+                led_set_pixel_with_brightness(i, rx_buffer[i * 3], rx_buffer[i * 3 + 1], rx_buffer[i * 3 + 2]);
             }
 
             // Clear any remaining LEDs if packet is shorter than configured strip
@@ -926,7 +1111,105 @@ static void led_udp_task(void *pvParameters) {
     }
     vTaskDelete(NULL);
 }
-#endif
+
+/* ============================================================================
+ * DDP (Distributed Display Protocol) Receiver Task — WLED Compatible
+ * Port 4048, 10-byte header + raw RGB payload
+ * ========================================================================== */
+#define DDP_HEADER_LEN     10
+#define DDP_FLAGS1_VER1    0x40
+#define DDP_FLAGS1_PUSH    0x01
+
+static void led_ddp_task(void *pvParameters) {
+    uint8_t rx_buffer[1500];
+    struct sockaddr_in dest_addr;
+
+    while (1) {
+        dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(CONFIG_WOL_LED_DDP_PORT);
+
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create DDP socket: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        struct timeval timeout;
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0) {
+            ESP_LOGE(TAG, "DDP socket bind failed: errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "DDP receiver listening on port %d (WLED-compatible)", CONFIG_WOL_LED_DDP_PORT);
+
+        while (1) {
+            struct sockaddr_storage source_addr;
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
+
+            if (len < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ESP_LOGE(TAG, "DDP recvfrom failed: errno %d", errno);
+                    break;
+                }
+                continue;
+            }
+
+            /* Need at least the DDP header */
+            if (len < DDP_HEADER_LEN) continue;
+            if (!wled_on) continue; /* Respect WLED on/off state */
+
+            /* Parse DDP header */
+            uint8_t flags1 = rx_buffer[0];
+            /* uint8_t flags2 = rx_buffer[1]; — reserved */
+            /* uint8_t type   = rx_buffer[2]; */
+            /* uint8_t id     = rx_buffer[3]; */
+            uint32_t offset = ((uint32_t)rx_buffer[4] << 24) |
+                              ((uint32_t)rx_buffer[5] << 16) |
+                              ((uint32_t)rx_buffer[6] << 8)  |
+                              ((uint32_t)rx_buffer[7]);
+            uint16_t data_len = ((uint16_t)rx_buffer[8] << 8) | rx_buffer[9];
+
+            /* Pixel data starts after header */
+            uint8_t *pixel_data = rx_buffer + DDP_HEADER_LEN;
+            int available = len - DDP_HEADER_LEN;
+            if (data_len > available) data_len = available;
+
+            /* Offset is in bytes; each pixel = 3 bytes (RGB) */
+            int pixel_offset = offset / 3;
+            int num_pixels = data_len / 3;
+            int limit = pixel_offset + num_pixels;
+            if (limit > CONFIG_WOL_LED_STRIP_NUM) limit = CONFIG_WOL_LED_STRIP_NUM;
+
+            for (int i = pixel_offset; i < limit; i++) {
+                int data_idx = (i - pixel_offset) * 3;
+                led_set_pixel_with_brightness(i, pixel_data[data_idx], pixel_data[data_idx + 1], pixel_data[data_idx + 2]);
+            }
+
+            /* Push flag: frame complete, refresh the strip */
+            if (flags1 & DDP_FLAGS1_PUSH) {
+                led_strip_refresh(led_strip_h);
+            }
+        }
+
+        if (sock != -1) {
+            ESP_LOGE(TAG, "DDP socket error, restarting...");
+            shutdown(sock, 0);
+            close(sock);
+        }
+    }
+    vTaskDelete(NULL);
+}
+#endif /* CONFIG_WOL_LED_STRIP_ENABLED */
 
 static void wifi_init(void) {
     wifi_event_group = xEventGroupCreate();
@@ -1031,8 +1314,13 @@ void app_main(void) {
     /* Initialize the LED strip */
     led_strip_init();
 
-    /* Start the UDP receiver task */
+    /* Start the UDPRAW receiver task (legacy, port 19446) */
     xTaskCreate(led_udp_task, "led_udp", 4096, NULL, 5, NULL);
+
+    /* Start the DDP receiver task (WLED-compatible, port 4048) */
+    xTaskCreate(led_ddp_task, "led_ddp", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "WLED API emulation active — DDP port %d, UDPRAW port %d",
+             CONFIG_WOL_LED_DDP_PORT, CONFIG_WOL_LED_UDP_PORT);
 #endif
 
     /* Initialize MicroLink Tailscale Client */

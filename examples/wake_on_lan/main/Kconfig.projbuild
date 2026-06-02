@@ -64,4 +64,11 @@ menu "Wake-on-LAN Configuration"
         help
             UDP port to listen on for raw RGB pixel data from HyperHDR (default is 19446).
 
+    config WOL_LED_DDP_PORT
+        int "DDP Protocol Port"
+        depends on WOL_LED_STRIP_ENABLED
+        default 4048
+        help
+            UDP port for DDP (Distributed Display Protocol) used by WLED. Default is 4048.
+
 endmenu
