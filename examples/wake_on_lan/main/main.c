@@ -74,6 +74,7 @@ static char vpn_ip_str[16] = "0.0.0.0";
 static bool wled_on = true;
 static uint8_t wled_brightness = 255;
 static char esp_mac_str[13] = "000000000000"; /* hex MAC for WLED info */
+static led_strip_handle_t led_strip_h = NULL;
 #endif
 
 /* HTML Dashboard content (glassmorphic dark theme) */
@@ -991,7 +992,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 #if CONFIG_WOL_LED_STRIP_ENABLED
-static led_strip_handle_t led_strip_h = NULL;
 
 static void led_strip_init(void) {
     /* LED strip common configuration */
