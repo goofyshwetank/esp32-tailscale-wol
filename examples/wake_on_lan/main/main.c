@@ -737,7 +737,7 @@ static esp_err_t wled_state_post_handler(httpd_req_t *req) {
     }
     body[received] = '\0';
 
-    ESP_LOGI(TAG, "WLED state POST: %s", body);
+    ESP_LOGI(TAG, "WLED state POST/PUT: %s", body);
 
     /* Minimal JSON parsing for "on" and "bri" fields */
     char *on_ptr = strstr(body, "\"on\"");
@@ -838,6 +838,7 @@ static httpd_handle_t start_webserver(void) {
         httpd_uri_t wled_json_uri = { .uri = "/json", .method = HTTP_GET, .handler = wled_json_get_handler };
         httpd_uri_t wled_state_get_uri = { .uri = "/json/state", .method = HTTP_GET, .handler = wled_state_get_handler };
         httpd_uri_t wled_state_post_uri = { .uri = "/json/state", .method = HTTP_POST, .handler = wled_state_post_handler };
+        httpd_uri_t wled_state_put_uri = { .uri = "/json/state", .method = HTTP_PUT, .handler = wled_state_post_handler };
         httpd_uri_t wled_info_uri = { .uri = "/json/info", .method = HTTP_GET, .handler = wled_info_get_handler };
         httpd_uri_t wled_eff_uri = { .uri = "/json/eff", .method = HTTP_GET, .handler = wled_eff_get_handler };
         httpd_uri_t wled_pal_uri = { .uri = "/json/pal", .method = HTTP_GET, .handler = wled_pal_get_handler };
@@ -845,6 +846,7 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &wled_json_uri);
         httpd_register_uri_handler(server, &wled_state_get_uri);
         httpd_register_uri_handler(server, &wled_state_post_uri);
+        httpd_register_uri_handler(server, &wled_state_put_uri);
         httpd_register_uri_handler(server, &wled_info_uri);
         httpd_register_uri_handler(server, &wled_eff_uri);
         httpd_register_uri_handler(server, &wled_pal_uri);
