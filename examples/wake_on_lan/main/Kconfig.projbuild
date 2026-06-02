@@ -38,4 +38,30 @@ menu "Wake-on-LAN Configuration"
         help
             The netmask for the network subnet (usually 255.255.255.0).
 
+    config WOL_LED_STRIP_ENABLED
+        bool "Enable LED Strip capture for HyperHDR (UDPRAW)"
+        help
+            Enable capture of raw UDP packets to drive WS2812B LEDs.
+
+    config WOL_LED_STRIP_GPIO
+        int "LED Strip GPIO Pin"
+        depends on WOL_LED_STRIP_ENABLED
+        default 18
+        help
+            GPIO pin connected to the DI (Data Input) of the WS2812B LED strip.
+
+    config WOL_LED_STRIP_NUM
+        int "Number of LEDs"
+        depends on WOL_LED_STRIP_ENABLED
+        default 30
+        help
+            Number of addressable LEDs on the WS2812B strip.
+
+    config WOL_LED_UDP_PORT
+        int "UDPRAW Capture Port"
+        depends on WOL_LED_STRIP_ENABLED
+        default 19446
+        help
+            UDP port to listen on for raw RGB pixel data from HyperHDR (default is 19446).
+
 endmenu

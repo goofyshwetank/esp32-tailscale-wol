@@ -28,6 +28,10 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 
+#if CONFIG_WOL_LED_STRIP_ENABLED
+#include "led_strip.h"
+#endif
+
 #include "microlink.h"
 #include "microlink_internal.h"
 #include "ml_config_httpd.h"
@@ -820,6 +824,110 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+#if CONFIG_WOL_LED_STRIP_ENABLED
+static led_strip_handle_t led_strip_h = NULL;
+
+static void led_strip_init(void) {
+    /* LED strip common configuration */
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = CONFIG_WOL_LED_STRIP_GPIO,
+        .max_leds = CONFIG_WOL_LED_STRIP_NUM,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+
+    /* RMT backend configuration */
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz resolution
+        .flags.with_dma = false,
+    };
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip_h));
+    led_strip_clear(led_strip_h);
+    ESP_LOGI(TAG, "WS2812B LED strip initialized on GPIO %d, %d LEDs", 
+             CONFIG_WOL_LED_STRIP_GPIO, CONFIG_WOL_LED_STRIP_NUM);
+}
+
+static void led_udp_task(void *pvParameters) {
+    uint8_t rx_buffer[1500];
+    struct sockaddr_in dest_addr;
+
+    while (1) {
+        dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(CONFIG_WOL_LED_UDP_PORT);
+
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket for LED UDP: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Set socket receive timeout
+        struct timeval timeout;
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0) {
+            ESP_LOGE(TAG, "Socket bind failed for LED UDP: errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "HyperHDR UDPRAW receiver listening on port %d", CONFIG_WOL_LED_UDP_PORT);
+
+        while (1) {
+            struct sockaddr_storage source_addr;
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
+
+            if (len < 0) {
+                // Timeout or error, just loop
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+                    break;
+                }
+                continue;
+            }
+
+            // Parse raw RGB packet
+            // Packet should contain 3 bytes (R, G, B) per LED.
+            int num_leds_received = len / 3;
+            int limit = (num_leds_received < CONFIG_WOL_LED_STRIP_NUM) ? num_leds_received : CONFIG_WOL_LED_STRIP_NUM;
+
+            for (int i = 0; i < limit; i++) {
+                uint8_t r = rx_buffer[i * 3];
+                uint8_t g = rx_buffer[i * 3 + 1];
+                uint8_t b = rx_buffer[i * 3 + 2];
+                led_strip_set_pixel(led_strip_h, i, r, g, b);
+            }
+
+            // Clear any remaining LEDs if packet is shorter than configured strip
+            if (limit < CONFIG_WOL_LED_STRIP_NUM) {
+                for (int i = limit; i < CONFIG_WOL_LED_STRIP_NUM; i++) {
+                    led_strip_set_pixel(led_strip_h, i, 0, 0, 0);
+                }
+            }
+
+            led_strip_refresh(led_strip_h);
+        }
+
+        if (sock != -1) {
+            ESP_LOGE(TAG, "Shutting down socket and restarting...");
+            shutdown(sock, 0);
+            close(sock);
+        }
+    }
+    vTaskDelete(NULL);
+}
+#endif
+
 static void wifi_init(void) {
     wifi_event_group = xEventGroupCreate();
 
@@ -918,6 +1026,14 @@ void app_main(void) {
 
     /* Wait until local network is established */
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+#if CONFIG_WOL_LED_STRIP_ENABLED
+    /* Initialize the LED strip */
+    led_strip_init();
+
+    /* Start the UDP receiver task */
+    xTaskCreate(led_udp_task, "led_udp", 4096, NULL, 5, NULL);
+#endif
 
     /* Initialize MicroLink Tailscale Client */
     microlink_config_t config = {
